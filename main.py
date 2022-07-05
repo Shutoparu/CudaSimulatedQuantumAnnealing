@@ -1,5 +1,3 @@
-from logging.handlers import TimedRotatingFileHandler
-import os
 import numpy as np
 import numpy.ctypeslib as ctplib
 from ctypes import c_float, c_int, cdll, POINTER
@@ -7,9 +5,9 @@ import time
 
 np.random.seed(1)
 
-dim = 500
+dim = 15
 trotterNum = 4
-sweeps = 100
+sweeps = 20
 
 qubo = 2 * np.random.rand(dim, dim).astype(np.float32) - 1
 qubo = (qubo + qubo.T) / 2
@@ -34,6 +32,6 @@ end = time.time()
 
 spin = ctplib.as_array(spin)
 
-print("{}".format(energy))
+print(f"%.9f" % energy)
 print(spin)
 print("spent time: ", end-start)

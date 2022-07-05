@@ -5,7 +5,7 @@
 #include <curand_kernel.h>
 #include <random>
 
-#define K 0.5
+#define K 0
 
 texture<float, 1, cudaReadModeElementType> Q_text;
 texture<int, 1, cudaReadModeElementType> s_text;
@@ -90,15 +90,33 @@ __global__ void calculate(int *trotterBlock, int spinIdx, int dim, int trotterNu
     // if (index < dim)
     if (index == 0)
     {
+        int flipped = 0;
+        float delta_E = 0;
         curandState state;
         curand_init(seed, index, 0, &state);
 
-        // calculate<<<1, 1>>>(trotterBlock[j * dim + i - j]);
-        int quboRowIdx = spinIdx % dim;
-        float delta_E = 0;
-        for (int i = 0; i < dim; i++)
+        // get energy change for flipping the bit [i] (check delta_E)
+
+        // check flip
+        if (tex1Dfetch(s_text, spinIdx) == 0)
         {
-            delta_E += tex1Dfetch(s_text, (spinIdx / dim) * dim + i) * tex1Dfetch(Q_text, quboRowIdx * dim + i);
+            flipped = 1;
+        }
+
+        for (int n = 0; n < dim; n++)
+        {
+            if (n == spinIdx % dim && flipped == 1)
+            {
+                delta_E += tex1Dfetch(Q_text, (spinIdx % dim) * dim + n); // time consuming
+            }
+            else
+            {
+                delta_E += tex1Dfetch(s_text, dim * (spinIdx % dim) + n) * tex1Dfetch(Q_text, (spinIdx % dim) * dim + n); // time consuming
+            }
+        }
+        if (flipped == 0)
+        {
+            delta_E *= -1;
         }
 
         // calcPre<<<1, 1>>>(trotterBlock[(j - 1) * dim + i - j]);
@@ -108,23 +126,33 @@ __global__ void calculate(int *trotterBlock, int spinIdx, int dim, int trotterNu
         }
         else
         {
-            delta_E -= tex1Dfetch(pre_s_text, dim * (trotterNum - 1) + quboRowIdx) * K;
+            delta_E -= tex1Dfetch(s_text, dim * (trotterNum - 1) + spinIdx % dim) * K;
         }
 
         // calcAfter<<<1, 1>>>(prevTrotterBlock[(j + 1) * dim + i - j]);
         if (spinIdx + dim < dim * trotterNum)
         {
-            delta_E += tex1Dfetch(pre_s_text, spinIdx + dim) * K;
+            delta_E += tex1Dfetch(s_text, spinIdx + dim) * K;
         }
         else
         {
-            delta_E += tex1Dfetch(pre_s_text, quboRowIdx) * K;
+            delta_E += tex1Dfetch(s_text, spinIdx % dim) * K;
         }
 
-        // check flip
-        if (exp(-1 * delta_E / beta) > 1)
+        if (flipped == 0)
+        {
+            delta_E *= -1;
+        }
+
+        if (delta_E < 0)
         {
             trotterBlock[spinIdx] *= -1;
+            trotterBlock[spinIdx] += 1;
+        }
+        else if (exp(-1 * delta_E / beta) > curand_uniform(&state))
+        {
+            trotterBlock[spinIdx] *= -1;
+            trotterBlock[spinIdx] += 1;
         }
     }
 }
@@ -151,18 +179,14 @@ float simulatedQA(int *s, float *Q, int dim, int trotterNum, int totalSweeps)
     int *trotterBlock;
     cudaMalloc(&trotterBlock, trotterNum * dim * sizeof(int));
 
-    int *trotterBlockLocal;
-    cudaMallocHost(&trotterBlockLocal, trotterNum * dim * sizeof(int));
-
     int *prevTrotterBlock;
     cudaMalloc(&prevTrotterBlock, trotterNum * dim * sizeof(int));
 
-    for (int i = 0; i < trotterNum * dim; i++)
+    for (int i = 0; i < trotterNum; i++)
     {
-        trotterBlockLocal[i] = (int)(((int)(rand() / RAND_MAX) - 0.5) * 2);
+        cudaErr(cudaMemcpy(&trotterBlock[i * dim], s, dim * sizeof(int), cudaMemcpyHostToDevice));
     }
 
-    cudaErr(cudaMemcpy(trotterBlock, trotterBlockLocal, dim * trotterNum * sizeof(int), cudaMemcpyHostToDevice));
     cudaErr(cudaMemcpy(prevTrotterBlock, trotterBlock, dim * trotterNum * sizeof(int), cudaMemcpyDeviceToDevice));
 
     float *beta;
@@ -192,7 +216,7 @@ float simulatedQA(int *s, float *Q, int dim, int trotterNum, int totalSweeps)
                     cudaStream_t stream;
                     cudaStreamCreate(&stream);
                     // calculate in parallel psudocode //
-                    calculate<<<32, 32, 0, stream>>>(trotterBlock, j * dim + i - j, dim, trotterNum, beta[sweep], rand());
+                    calculate<<<1, 1, 0, stream>>>(trotterBlock, j * dim + i - j, dim, trotterNum, beta[sweep], rand());
                     cudaStreamDestroy(stream);
                 }
             }
@@ -200,20 +224,16 @@ float simulatedQA(int *s, float *Q, int dim, int trotterNum, int totalSweeps)
         }
         cudaMemcpy(prevTrotterBlock, trotterBlock, trotterNum * dim * sizeof(int), cudaMemcpyDeviceToDevice);
 
-        cudaMemcpy(trotterBlockLocal, trotterBlock, trotterNum * dim * sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(s, &trotterBlockLocal[dim * (trotterNum - 1)], dim * sizeof(int), cudaMemcpyHostToHost);
+        cudaMemcpy(s, &trotterBlock[dim * (trotterNum - 1)], dim * sizeof(int), cudaMemcpyDeviceToHost); // dim * (trotterNum - 1)
         for (int i = 0; i < dim; i++)
         {
-            printf("%2d ", s[i]);
+            printf("%d", s[i]);
         }
         printf("\n");
         // printf("%.9f\n", energy(s, Q, dim));
     }
 
-    float en;
-
-    cudaMemcpy(trotterBlockLocal, trotterBlock, trotterNum * dim * sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(s, &trotterBlockLocal[dim * (trotterNum - 1)], dim * sizeof(int), cudaMemcpyHostToHost);
+    cudaMemcpy(s, &trotterBlock[0], dim * sizeof(int), cudaMemcpyDeviceToHost); // dim * (trotterNum - 1)
 
     cudaUnbindTexture(Q_text);
     cudaUnbindTexture(s_text);
@@ -222,8 +242,8 @@ float simulatedQA(int *s, float *Q, int dim, int trotterNum, int totalSweeps)
     cudaFree(trotterBlock);
     cudaFree(prevTrotterBlock);
     cudaFree(Q_dev);
-    cudaFreeHost(trotterBlockLocal);
 
+    float en;
     en = energy(s, Q, dim);
     printf("%f\n", en);
     return en;
